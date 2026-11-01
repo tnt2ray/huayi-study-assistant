@@ -8,6 +8,8 @@
   const AUTO_NEXT_DELAY_MS = 1000;
   const STUDY_CHANNEL = 'huayi-study-flow-v1';
   const INITIAL_RESTORE_WINDOW_MS = 15000;
+  const INITIAL_AUTOPLAY_WINDOW_MS = 45000;
+  const initialAutoPlayDeadline = Date.now() + INITIAL_AUTOPLAY_WINDOW_MS;
 
   let autoNextScheduled = false;
   let autoNextTimer = null;
@@ -18,6 +20,9 @@
   let pendingInitialRestore = null;
   let publishedRoute = null;
   let navigationGeneration = 0;
+  let initialAutoPlayStopped = false;
+  let initialPlayAttempt = null;
+  let lastInitialPlayAttemptAt = 0;
 
   function clearExistingSignDialog() {
     if (pageLeaving || window.abnormalPluginBlocked || window.securityAlertShown) {
@@ -579,7 +584,7 @@
   function wrapOnPlayOver() {
     if (
       typeof window.s2j_onPlayOver !== 'function' ||
-      window.s2j_onPlayOver.__huayiAutoNextVersion__ === '1.0.0'
+      window.s2j_onPlayOver.__huayiAutoNextVersion__ === '1.0.1'
     ) {
       return;
     }
@@ -599,56 +604,87 @@
       return result;
     };
     patchedOnPlayOver[PLAY_OVER_PATCH_FLAG] = true;
-    patchedOnPlayOver.__huayiAutoNextVersion__ = '1.0.0';
+    patchedOnPlayOver.__huayiAutoNextVersion__ = '1.0.1';
     patchedOnPlayOver.__originalOnPlayOver__ = originalOnPlayOver;
     window.s2j_onPlayOver = patchedOnPlayOver;
   }
 
-  function ensureInitialAutoPlay() {
+  function stopInitialAutoPlay() {
+    initialAutoPlayStopped = true;
+    initialPlayAttempt = null;
+  }
+
+  function initialPlaybackBlocked() {
+    // The transport-dialog exception applies to completed-video navigation only.
+    return hasNavigationBlocker() || !navigator.onLine ||
+      Boolean(document.querySelector('.study_diaog')) ||
+      Array.from(document.querySelectorAll('.layui-layer-dialog')).some(isElementVisible);
+  }
+
+  function canContinueInitialPlay(attempt) {
+    const video = attempt.video;
+    return !initialAutoPlayStopped && Date.now() < initialAutoPlayDeadline &&
+      initialPlayAttempt === attempt && getPlaybackVideo() === video &&
+      window.player === attempt.player &&
+      (video.currentSrc || video.src) === attempt.source &&
+      video.paused && !video.ended && !video.seeking && !video.error &&
+      !initialPlaybackBlocked();
+  }
+
+  async function startInitialPlay(attempt) {
+    const video = attempt.video;
     try {
-      if (hasNavigationBlocker()) {
-        return;
+      try {
+        const pending = attempt.player.j2s_resumeVideo();
+        if (pending && typeof pending.catch === 'function') pending.catch(function () {});
+      } catch (err) {
+        // The media element below reports whether autoplay was actually denied.
       }
-      // 仅在首次加载尚未起播阶段（ifFirstPlay === 1）辅助唤醒自动播放，不干扰用户手动暂停
-      if (typeof window.ifFirstPlay !== 'undefined' && window.ifFirstPlay !== 1) {
-        return;
-      }
-      if (
-        isElementVisible(document.getElementById('div_tip1')) ||
-        document.querySelector('.study_diaog')
-      ) {
-        return;
-      }
-
-      const video = document.querySelector('#video video.pv-video, #video video');
-      if (!video || !video.paused) {
-        return;
-      }
-
-      if (
-        typeof window.player !== 'undefined' &&
-        window.player &&
-        typeof window.player.j2s_resumeVideo === 'function'
-      ) {
-        window.player.j2s_resumeVideo();
-      }
-
-      if (video.paused && typeof video.play === 'function') {
-        const playPromise = video.play();
-        if (playPromise && typeof playPromise.catch === 'function') {
-          playPromise.catch(function () {
-            if (hasNavigationBlocker() || pageLeaving) {
-              return;
-            }
-            // 浏览器阻止有声自动播放时，回退为静音起播以保证连续挂机学习
-            video.muted = true;
-            video.play().catch(function () {});
-          });
-        }
+      if (!canContinueInitialPlay(attempt)) return;
+      try {
+        await video.play();
+      } catch (err) {
+        if (!err || err.name !== 'NotAllowedError' || !canContinueInitialPlay(attempt)) return;
+        // Only autoplay-policy rejection permits a muted retry on this same source.
+        video.muted = true;
+        await video.play();
       }
     } catch (err) {
-      // 保持静默
+      // A later readiness event may retry; never interrupt the site's player.
+    } finally {
+      if (initialPlayAttempt === attempt) initialPlayAttempt = null;
     }
+  }
+
+  function ensureInitialAutoPlay() {
+    if (initialAutoPlayStopped) return;
+    if (pageLeaving || Date.now() >= initialAutoPlayDeadline) {
+      stopInitialAutoPlay();
+      return;
+    }
+    const video = getPlaybackVideo();
+    if (!video) return;
+    // A saved currentTime or the site's first-play flag does not prove playback.
+    // Once this document really played, later pauses belong to the user/site.
+    if (video.ended || video.played.length > 0 || (!video.paused && video.readyState >= 3)) {
+      stopInitialAutoPlay();
+      return;
+    }
+    if (!video.paused || video.seeking || video.error || initialPlaybackBlocked()) return;
+    const player = window.player;
+    if (!player || typeof player.j2s_resumeVideo !== 'function') return;
+    const source = video.currentSrc || video.src;
+    if (initialPlayAttempt && initialPlayAttempt.video === video &&
+        initialPlayAttempt.player === player && initialPlayAttempt.source === source) return;
+    if (Date.now() - lastInitialPlayAttemptAt < 1000) return;
+    // Readiness can arrive between installer polls; attach callbacks before starting.
+    wrapOnPlayStart();
+    wrapOnPlayOver();
+    observePlaybackEnd();
+    lastInitialPlayAttemptAt = Date.now();
+    const attempt = { video: video, player: player, source: source };
+    initialPlayAttempt = attempt;
+    startInitialPlay(attempt);
   }
 
   function installPatch() {
@@ -669,12 +705,19 @@
     ) {
       scheduleAutoNextCourseware();
     }
+    ensureInitialAutoPlay();
   }
 
+  ['loadedmetadata', 'loadeddata', 'canplay', 'playing', 'timeupdate'].forEach(function (type) {
+    document.addEventListener(type, function (event) {
+      if (event.target === getPlaybackVideo()) ensureInitialAutoPlay();
+    }, true);
+  });
   installPatch();
   window.addEventListener('load', installPatch, { once: true });
   window.addEventListener('pagehide', function () {
     pageLeaving = true;
+    stopInitialAutoPlay();
     if (!autoNextNavigated) {
       signalConnectionTransition('cancel');
     }
@@ -685,6 +728,7 @@
     document.addEventListener(type, function (event) {
       if (event.isTrusted) {
         cancelInitialRestore();
+        stopInitialAutoPlay();
       }
     }, true);
   });
@@ -693,9 +737,6 @@
   let checks = 0;
   const checkTimer = setInterval(function () {
     installPatch();
-    if (checks >= 3 && checks <= 10) {
-      ensureInitialAutoPlay();
-    }
     checks += 1;
     if (checks >= 20) {
       clearInterval(checkTimer);
