@@ -56,6 +56,14 @@
     const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
     return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
   }
+  async function entryDigest(value) {
+    if (typeof value !== 'string' || !value.length || value.length > 128 || /[\u0000-\u001f\u007f]/.test(value)) fail('changed');
+    return digest(value);
+  }
+  function pendingRetake(record, owner) {
+    return record && record.status === 'retrying' && record.tabId === owner.tabId &&
+      !record.paused && Number.isFinite(record.retryAt) && Date.now() - record.retryAt <= 120000;
+  }
 
   async function saveRecords() {
     // Keep only bounded status/digest records, never question text, model reasoning or credentials.
@@ -334,11 +342,12 @@
     return result;
   }
 
-  async function answerPlan(questions, catalog, history) {
+  async function answerPlan(questions, catalog, history, numberedHistory) {
     const pending = [], retained = [];
     let excluded = 0;
     for (let i = 0; i < questions.length; i += 1) {
-      const q = questions[i], item = catalog[i], known = history[item.key];
+      const q = questions[i], item = catalog[i];
+      const known = numberedHistory ? numberedHistory[q.n - 1] : history[item.key];
       // Map legacy digests only through the explicitly supported spellings.
       if (known) {
         const wrong = known.wrong.map(hash => currentOption(item, hash));
@@ -380,6 +389,8 @@
       excluded: record.excluded || 0, retained: record.retained || 0,
       requested: record.requested ?? Math.max(0, (record.count || 0) - (record.retained || 0)),
       retryAvailable: sameDocument && record.retryAvailable === true && !record.paused,
+      retryMethod: sameDocument ? record.retryMethod || 'native' : undefined,
+      numberAnchored: sameDocument && record.numberAnchored === true,
       resultDigest: sameDocument ? record.resultDigest : undefined,
       wrongCount: record.wrongCount || 0 };
   }
@@ -423,7 +434,10 @@
       if (message.outcome !== 'passed') fail('feedback-conflict');
       return view(record, owner);
     }
-    if (record && ['requesting', 'ready', 'retrying'].includes(record.status)) return view(record, owner);
+    const pendingFeedback = record && record.status === 'retrying' && record.documentId === owner.documentId &&
+      ['back', 'fallback'].includes(record.retryMethod);
+    if (record && ['requesting', 'ready', 'retrying'].includes(record.status) && !pendingFeedback) return view(record, owner);
+    if (pendingFeedback && message.outcome !== 'failed') fail('feedback-conflict');
     if (message.outcome === 'passed') {
       await stop(owner.key);
       record = records[owner.key] = { ...record, version: 2, status: 'passed',
@@ -470,6 +484,7 @@
       await saveRecords();
       return view(record, owner);
     }
+    if (pendingFeedback) fail('feedback-conflict');
     if (record && record.version === 2 && record.status === 'submitting' &&
         (!record.submitted || record.submitted.length !== rows.length || rows.some(row =>
           !record.submitted.some(item => item.key === row.key && item.selected === row.selected)))) fail('feedback-submission');
@@ -578,9 +593,14 @@
             record.status = 'cancelled';
             delete record.submitted;
           } else if (record.status === 'retrying') {
-            record.status = 'failed';
-            record.retryAvailable = true;
-            delete record.retryAt;
+            if (record.retryBackUsed) {
+              // A pause can release the pending native fallback, never the back traversal already used.
+              record.retryMethod = 'fallback'; record.paused = true;
+            } else {
+              record.status = 'failed';
+              record.retryAvailable = true;
+              delete record.retryAt;
+            }
           }
           if (record.status === 'cancelled') record.error = 'cancelled';
         }
@@ -630,10 +650,31 @@
         // Capture feedback before the site's own button navigates; never click or delay it here.
         const result = await acceptResult(message, owner, config);
         const latest = records[owner.key];
+        if (config.enabled && pendingRetake(latest, owner) && ['back', 'fallback'].includes(latest.retryMethod) &&
+            latest.documentId === owner.documentId) {
+          latest.retryMethod = 'native'; latest.retryAt = Date.now(); latest.at = Date.now();
+          await saveRecords();
+          return { permitted: true };
+        }
         if (!config.enabled || !latest || latest.status !== 'failed' || !latest.retryAvailable || latest.paused ||
             latest.tabId !== owner.tabId || latest.documentId !== owner.documentId) return result;
-        latest.status = 'retrying'; latest.retryAvailable = false;
+        latest.status = 'retrying'; latest.retryAvailable = false; latest.retryMethod = 'native';
         latest.retryAt = Date.now(); latest.at = Date.now();
+        await saveRecords();
+        return { permitted: true };
+      }
+      if (message.action === 'resume-retry') {
+        if (!config.enabled || !pendingRetake(record, owner) || record.retryMethod !== 'returning' ||
+            await entryDigest(message.entryKey) !== record.retryFromEntry) return { permitted: false };
+        record.documentId = owner.documentId; record.retryMethod = 'fallback'; record.at = Date.now();
+        await saveRecords();
+        return { permitted: true };
+      }
+      if (message.action === 'fallback-retry') {
+        if (!config.enabled || !pendingRetake(record, owner) || !['back', 'fallback'].includes(record.retryMethod) ||
+            record.documentId !== owner.documentId || message.resultDigest !== record.resultDigest ||
+            await entryDigest(message.entryKey) !== record.retryFromEntry) fail('changed');
+        record.retryMethod = 'native'; record.retryBackUsed = true; record.at = Date.now();
         await saveRecords();
         return { permitted: true };
       }
@@ -641,7 +682,36 @@
       if (!config.enabled || !record || record.status !== 'failed' || !record.retryAvailable || record.paused ||
           record.documentId !== owner.documentId || record.tabId !== owner.tabId ||
           message.resultDigest !== record.resultDigest) fail('changed');
-      record.status = 'retrying'; record.retryAvailable = false; record.retryAt = Date.now(); record.at = Date.now();
+      const method = message.method === undefined ? 'native' : message.method;
+      if (!['back', 'native'].includes(method)) fail('changed');
+      if (method === 'back') {
+        const from = await entryDigest(message.entryKey), target = await entryDigest(message.targetEntryKey);
+        if (from === target) fail('changed');
+        if (record.examEntryDigest && target !== record.examEntryDigest) {
+          return { permitted: false, error: 'back-unavailable' };
+        }
+        record.retryFromEntry = from; record.retryTargetEntry = target;
+        delete record.retryExamDocumentId;
+      }
+      record.status = 'retrying'; record.retryAvailable = false; record.retryMethod = method;
+      record.retryAt = Date.now(); record.at = Date.now();
+      await saveRecords();
+      return { permitted: true };
+    }
+    if (message.action === 'resume-back') {
+      if (!config.enabled || !pendingRetake(record, owner) || record.retryMethod !== 'back' ||
+          record.documentId === owner.documentId || await entryDigest(message.entryKey) !== record.retryTargetEntry ||
+          (record.retryExamDocumentId && record.retryExamDocumentId !== owner.documentId)) return { permitted: false };
+      record.retryExamDocumentId = owner.documentId; record.retryBackUsed = true; record.at = Date.now();
+      await saveRecords();
+      return { permitted: true };
+    }
+    if (message.action === 'return-retry') {
+      if (!config.enabled || !pendingRetake(record, owner) || record.retryMethod !== 'back' ||
+          record.retryExamDocumentId !== owner.documentId ||
+          await entryDigest(message.entryKey) !== record.retryTargetEntry ||
+          await entryDigest(message.targetEntryKey) !== record.retryFromEntry) fail('changed');
+      record.retryMethod = 'returning'; record.at = Date.now();
       await saveRecords();
       return { permitted: true };
     }
@@ -670,7 +740,13 @@
     const questions = cleanQuestions(message.questions);
     const fingerprint = await digest(JSON.stringify(questions));
     const catalog = await describeQuestions(questions);
-    let history = {}, attempt = 1;
+    const currentEntry = message.entryKey ? await entryDigest(message.entryKey) : '';
+    const historyBack = message.historyBack === true;
+    const backEntry = record && record.status === 'retrying' && record.retryMethod === 'back';
+    if (historyBack && (!config.enabled || !pendingRetake(record, owner) || !backEntry ||
+        record.retryExamDocumentId !== owner.documentId || currentEntry !== record.retryTargetEntry)) fail('changed');
+    if (backEntry && !historyBack) fail('changed');
+    let history = {}, attempt = 1, numberedHistory = null;
     if (record) {
       // A normal navigation from this course's result page is a manual retake, not a reload.
       // The isolated script supplies only this boolean, never the referrer's full URL.
@@ -682,7 +758,8 @@
       }
       if (record.status === 'retrying' || resultEntry) {
         if (!resultEntry && (record.tabId !== owner.tabId || record.documentId === owner.documentId ||
-            Date.now() - record.retryAt > 120000)) fail('changed');
+            Date.now() - record.retryAt > 120000 ||
+            (record.retryMethod && !['back', 'native'].includes(record.retryMethod)))) fail('changed');
         attempt = (record.attempt || 1) + 1;
       } else {
         if (['requesting', 'ready'].includes(record.status)) {
@@ -698,13 +775,20 @@
         history = currentHistory(history, catalog);
         const expected = Object.keys(history);
         if (expected.length && (expected.length !== catalog.length || catalog.some(q => !history[q.key]))) fail('changed');
+        if (historyBack && record.fingerprint === fingerprint && record.catalog) {
+          numberedHistory = catalog.map(function (item, index) {
+            if (!record.catalog[index] || !currentQuestion([item], record.catalog[index])) fail('changed');
+            return history[item.key] || null;
+          });
+        }
       }
     }
-    const plan = await answerPlan(questions, catalog, history);
+    const plan = await answerPlan(questions, catalog, history, numberedHistory);
     const job = { controller: new AbortController(), answers: null, retainedAnswers: plan.retained };
     jobs.set(owner.key, job);
     records[owner.key] = { version: 2, tabId: owner.tabId, documentId: owner.documentId,
       fingerprint: fingerprint, status: 'requesting', mode: config.mode, model: config.mode === 'ai' ? config.model : '',
+      examEntryDigest: currentEntry, numberAnchored: numberedHistory !== null,
       catalog: catalog, history: history, attempt: attempt,
       excluded: plan.excluded, retained: plan.retained.length,
       requested: config.mode === 'ai' ? plan.pending.length : 0,
