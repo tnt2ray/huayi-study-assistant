@@ -3,11 +3,9 @@
 
   const PATCH_FLAG = '__huayiSilentSignPatched__';
   const PLAY_OVER_PATCH_FLAG = '__huayiAutoNextPlayOverPatched__';
-  const PLAY_START_PATCH_FLAG = '__huayiInitialRestorePatched__';
   const FINISHED_STATUS_TEXTS = ['待考试', '已完成', '已通过', '已学习', '考试通过'];
   const AUTO_NEXT_DELAY_MS = 1000;
   const STUDY_CHANNEL = 'huayi-study-flow-v1';
-  const INITIAL_RESTORE_WINDOW_MS = 15000;
   const INITIAL_AUTOPLAY_WINDOW_MS = 45000;
   const initialAutoPlayDeadline = Date.now() + INITIAL_AUTOPLAY_WINDOW_MS;
 
@@ -16,8 +14,6 @@
   let autoNextNavigated = false;
   let pageLeaving = false;
   const observedVideos = new WeakSet();
-  const observedSeekSources = new WeakSet();
-  let pendingInitialRestore = null;
   let publishedRoute = null;
   let navigationGeneration = 0;
   let initialAutoPlayStopped = false;
@@ -126,129 +122,6 @@
     } catch (err) {
       return '';
     }
-  }
-
-  function cancelInitialRestore() {
-    if (pendingInitialRestore) {
-      pendingInitialRestore.cancelled = true;
-      pendingInitialRestore = null;
-    }
-  }
-
-  function observeInitialRestore(player) {
-    const events = player && player.HTML5;
-    if (!events || typeof events.on !== 'function' || observedSeekSources.has(events)) {
-      return;
-    }
-    events.on('videoSeeked', function () {
-      const restore = pendingInitialRestore;
-      if (!restore || restore.player !== player || restore.consumed) {
-        return;
-      }
-      const elapsed = Date.now() - restore.startedAt;
-      let currentTime;
-      try {
-        currentTime = Number(player.j2s_getCurrentTime());
-      } catch (err) {
-        cancelInitialRestore();
-        return;
-      }
-      if (
-        elapsed > INITIAL_RESTORE_WINDOW_MS ||
-        !Number.isFinite(currentTime) ||
-        currentTime < restore.target - 0.5 ||
-        currentTime > restore.target + elapsed / 1000 + 2
-      ) {
-        cancelInitialRestore();
-        return;
-      }
-
-      restore.consumed = true;
-      // Run after the page's seek listeners, whichever order they were registered in.
-      setTimeout(function () {
-        if (
-          restore.cancelled ||
-          pendingInitialRestore !== restore ||
-          pageLeaving ||
-          window.abnormalPluginBlocked ||
-          window.securityAlertShown
-        ) {
-          return;
-        }
-        const notice = document.getElementById('div_processbar_tip');
-        if (notice === restore.notice) {
-          notice.style.display = 'none';
-        }
-        cancelInitialRestore();
-      }, 0);
-    });
-    observedSeekSources.add(events);
-  }
-
-  function wrapOnPlayStart() {
-    if (
-      typeof window.s2j_onPlayStart !== 'function' ||
-      window.s2j_onPlayStart[PLAY_START_PATCH_FLAG]
-    ) {
-      return;
-    }
-    const originalOnPlayStart = window.s2j_onPlayStart;
-    const patchedOnPlayStart = function () {
-      const player = window.player;
-      if (
-        window.ifFirstPlay !== 1 ||
-        !player ||
-        typeof player.j2s_seekVideo !== 'function' ||
-        typeof window.getMaxPlayTime !== 'function'
-      ) {
-        return originalOnPlayStart.apply(this, arguments);
-      }
-
-      observeInitialRestore(player);
-      const originalSeek = player.j2s_seekVideo;
-      const initialSeek = function (time) {
-        cancelInitialRestore();
-        const notice = document.getElementById('div_processbar_tip');
-        let savedProgress;
-        try {
-          savedProgress = Number(window.getMaxPlayTime());
-        } catch (err) {
-          savedProgress = NaN;
-        }
-        const target = Number(time);
-        // Only correlate the page's own first resume at its existing saved progress.
-        if (
-          notice &&
-          !isElementVisible(notice) &&
-          Number.isFinite(target) &&
-          target >= 0 &&
-          target === savedProgress
-        ) {
-          pendingInitialRestore = {
-            player: player,
-            notice: notice,
-            target: target,
-            startedAt: Date.now(),
-            consumed: false,
-            cancelled: false
-          };
-        }
-        return originalSeek.apply(this, arguments);
-      };
-      player.j2s_seekVideo = initialSeek;
-      try {
-        return originalOnPlayStart.apply(this, arguments);
-      } catch (err) {
-        cancelInitialRestore();
-        throw err;
-      } finally {
-        if (player.j2s_seekVideo === initialSeek) {
-          player.j2s_seekVideo = originalSeek;
-        }
-      }
-    };
-    patchedOnPlayStart[PLAY_START_PATCH_FLAG] = true;
-    window.s2j_onPlayStart = patchedOnPlayStart;
   }
 
   function getPlaybackVideo() {
@@ -584,7 +457,7 @@
   function wrapOnPlayOver() {
     if (
       typeof window.s2j_onPlayOver !== 'function' ||
-      window.s2j_onPlayOver.__huayiAutoNextVersion__ === '1.0.1'
+      window.s2j_onPlayOver.__huayiAutoNextVersion__ === '1.0.2'
     ) {
       return;
     }
@@ -604,7 +477,7 @@
       return result;
     };
     patchedOnPlayOver[PLAY_OVER_PATCH_FLAG] = true;
-    patchedOnPlayOver.__huayiAutoNextVersion__ = '1.0.1';
+    patchedOnPlayOver.__huayiAutoNextVersion__ = '1.0.2';
     patchedOnPlayOver.__originalOnPlayOver__ = originalOnPlayOver;
     window.s2j_onPlayOver = patchedOnPlayOver;
   }
@@ -678,7 +551,6 @@
         initialPlayAttempt.player === player && initialPlayAttempt.source === source) return;
     if (Date.now() - lastInitialPlayAttemptAt < 1000) return;
     // Readiness can arrive between installer polls; attach callbacks before starting.
-    wrapOnPlayStart();
     wrapOnPlayOver();
     observePlaybackEnd();
     lastInitialPlayAttemptAt = Date.now();
@@ -689,7 +561,6 @@
 
   function installPatch() {
     publishStudyRoute('cache');
-    wrapOnPlayStart();
     observePlaybackEnd();
     clearExistingSignDialog();
 
@@ -721,13 +592,11 @@
     if (!autoNextNavigated) {
       signalConnectionTransition('cancel');
     }
-    cancelInitialRestore();
     cancelAutoNext();
   });
   ['pointerdown', 'touchstart', 'keydown'].forEach(function (type) {
     document.addEventListener(type, function (event) {
       if (event.isTrusted) {
-        cancelInitialRestore();
         stopInitialAutoPlay();
       }
     }, true);

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main():
     source_files = (
-        "manifest.json", "content-main.js", "session-observer.js", "connection-bridge.js",
+        "manifest.json", "content-main.js", "course.css", "session-observer.js", "connection-bridge.js",
         "background.js", "magpie-config.js", "magpie-client.js", "exam-background.js",
         "exam-content.js", "study-bridge.js", "popup.html", "popup.js", "popup.css", "安装说明.txt",
         "icons/icon-16.png", "icons/icon-24.png", "icons/icon-32.png", "icons/icon-48.png",
