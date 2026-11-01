@@ -107,10 +107,9 @@
         control: control || null
       });
       pending.catch(function () {
-        if (!chrome.runtime.id) {
-          stopped = true;
-          clearInterval(timer);
-        }
+        try { if (chrome.runtime && chrome.runtime.id) return; } catch (err) {}
+        stopped = true;
+        clearInterval(timer);
       });
     } catch (err) {
       stopped = true;

@@ -32,13 +32,24 @@
 
   function fail(code) { throw new Error(code); }
   function normalized(value) { return value.normalize('NFC').replace(/\s+/g, ' ').trim(); }
-  // Observed on the same course: exam option SpO? becomes SpO₂ on the result page.
-  // Normalize only this token for identity; keep displayed and transmitted option text intact.
-  function optionIdentity(value) { return normalized(value).replace(/SpO₂/g, 'SpO?'); }
-  async function optionDigests(value) {
-    const text = optionIdentity(value);
-    const key = await digest(text);
-    return { key: key, alternate: text.includes('SpO?') ? await digest(text.replace(/SpO\?/g, 'SpO₂')) : key };
+  // Only reconcile spellings observed across the site's exam and result pages.
+  const subscriptOne = String.fromCharCode(0x2081), subscriptTwo = String.fromCharCode(0x2082);
+  const identitySpellings = [
+    ['SpO?', 'SpO' + subscriptTwo], ['ppoFEV?', 'ppoFEV' + subscriptOne],
+    ['cmH?O', 'cmH' + subscriptTwo + 'O'], ['VO?max', 'VO' + subscriptTwo + 'max']
+  ];
+  function textIdentity(value) {
+    return identitySpellings.reduce((text, pair) => text.split(pair[1]).join(pair[0]), normalized(value));
+  }
+  async function identityDigests(value) {
+    const text = textIdentity(value), variants = [text];
+    for (const [plain, display] of identitySpellings) {
+      if (text.includes(plain)) variants.push(...variants.map(item => item.split(plain).join(display)));
+    }
+    // Include legacy raw and SpO-only digests without retaining the source text.
+    variants.push(normalized(value), normalized(value).split('SpO' + subscriptTwo).join('SpO?'));
+    const hashes = await Promise.all(Array.from(new Set(variants), digest));
+    return { key: hashes[0], aliases: hashes.slice(1) };
   }
   function questionText(value) { return normalized(value).replace(/^\d+\s*[、.．]\s*/, ''); }
   async function digest(value) {
@@ -119,9 +130,16 @@
   }
 
   function continuation(owner, config) {
-    const route = config.enabled && studyRoute(owner);
-    if (!route) return null;
-    return { nextUrl: route.path && route.courseId ?
+    if (!config.enabled) return null;
+    if (records[owner.key] && records[owner.key].nextClaimed) return { state: 'claimed', nextUrl: '' };
+    const route = studyRoute(owner);
+    if (!route) {
+      const saved = studyRoutes[owner.tabId];
+      const current = saved && saved.key === owner.key && saved.ready && Date.now() - saved.at < 86400000;
+      return { state: current && saved.claimed ? 'claimed' : current && saved.paused ? 'paused' : 'missing',
+        nextUrl: '' };
+    }
+    return { state: route.path && route.courseId ? 'ready' : 'finished', nextUrl: route.path && route.courseId ?
       nextCourseUrl(route.path + '?cwid=' + encodeURIComponent(route.courseId), owner).href : '' };
   }
 
@@ -135,8 +153,8 @@
       const options = q.options.map(function (option) {
         if (!option || !/^[A-Z]$/.test(option.label) || seen.has(option.label) ||
             typeof option.text !== 'string' || !option.text.trim() || option.text.length > 3000) fail('questions');
-        if (texts.has(optionIdentity(option.text))) fail('questions');
-        texts.add(optionIdentity(option.text));
+        if (texts.has(textIdentity(option.text))) fail('questions');
+        texts.add(textIdentity(option.text));
         seen.add(option.label);
         return { label: option.label, text: normalized(option.text) };
       });
@@ -161,7 +179,7 @@
       const answer = byNumber.get(q.n);
       if (!answer) fail('answer-format');
       const option = q.options.find(item => item.label === answer.answer);
-      const matches = !!option && typeof answer.text === 'string' && optionIdentity(answer.text) === optionIdentity(option.text);
+      const matches = !!option && typeof answer.text === 'string' && textIdentity(answer.text) === textIdentity(option.text);
       if (!matches) fail('answer-format');
       const confidence = ['high', 'medium', 'low'].includes(answer.confidence) ? answer.confidence :
         (typeof answer.confidence === 'number' && Number.isFinite(answer.confidence) &&
@@ -272,27 +290,48 @@
   async function describeQuestions(questions) {
     const result = [];
     for (const q of questions) {
-      const key = await digest(questionText(q.question));
-      if (result.some(item => item.key === key)) fail('questions');
-      const options = await Promise.all(q.options.map(o => optionDigests(o.text)));
-      result.push({ key: key, options: options.map(o => o.key), optionAliases: options.map(o => o.alternate) });
+      const question = await identityDigests(questionText(q.question));
+      if (result.some(item => item.key === question.key)) fail('questions');
+      const options = await Promise.all(q.options.map(o => identityDigests(o.text)));
+      result.push({ key: question.key, questionAliases: question.aliases,
+        options: options.map(o => o.key), optionAliases: options.map(o => o.aliases) });
     }
     return result;
   }
 
+  function currentQuestion(catalog, question) {
+    const keys = new Set([question.key, ...(question.questionAliases || [])]);
+    const matches = catalog.filter(item =>
+      keys.has(item.key) || (item.questionAliases || []).some(key => keys.has(key)));
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   function currentOption(item, hash) {
-    const matches = item.options.filter((option, index) => option === hash || item.optionAliases[index] === hash);
+    const matches = item.options.filter((option, index) => option === hash ||
+      [].concat(item.optionAliases && item.optionAliases[index] || []).includes(hash));
     return matches.length === 1 ? matches[0] : null;
   }
 
   function sameCatalog(before, after) {
     if (!before || before.length !== after.length) return false;
+    const matched = new Set();
     return after.every(item => {
-      const old = before.find(q => q.key === item.key);
-      if (!old || old.options.length !== item.options.length) return false;
+      const old = currentQuestion(before, item);
+      if (!old || matched.has(old.key) || old.options.length !== item.options.length) return false;
+      matched.add(old.key);
       const mapped = old.options.map(o => currentOption(item, o));
       return mapped.every(Boolean) && new Set(mapped).size === item.options.length;
     });
+  }
+
+  function currentHistory(history, catalog) {
+    const result = {};
+    for (const [key, known] of Object.entries(history)) {
+      const question = currentQuestion(catalog, { key: key });
+      if (!question || Object.prototype.hasOwnProperty.call(result, question.key)) fail('changed');
+      result[question.key] = known;
+    }
+    return result;
   }
 
   async function answerPlan(questions, catalog, history) {
@@ -300,7 +339,7 @@
     let excluded = 0;
     for (let i = 0; i < questions.length; i += 1) {
       const q = questions[i], item = catalog[i], known = history[item.key];
-      // Preserve older session digests when the only difference is the observed SpO token.
+      // Map legacy digests only through the explicitly supported spellings.
       if (known) {
         const wrong = known.wrong.map(hash => currentOption(item, hash));
         const correct = known.correct ? currentOption(item, known.correct) : null;
@@ -367,12 +406,13 @@
           typeof row.text !== 'string' || !row.text.trim() || row.text.length > 3000 ||
           !['wrong', 'correct'].includes(row.verdict)) fail('feedback');
       numbers.add(row.n);
-      const key = await digest(questionText(row.question));
-      if (rows.some(item => item.key === key)) fail('feedback');
-      const option = await optionDigests(row.text);
-      rows.push({ key: key, selected: option.key, alternate: option.alternate, verdict: row.verdict });
+      const question = await identityDigests(questionText(row.question));
+      if (rows.some(item => item.key === question.key)) fail('feedback');
+      const option = await identityDigests(row.text);
+      rows.push({ key: question.key, questionAliases: question.aliases,
+        selected: option.key, optionAliases: option.aliases, verdict: row.verdict });
     }
-    return rows.sort((a, b) => a.key.localeCompare(b.key));
+    return rows;
   }
 
   async function acceptResult(message, owner, config) {
@@ -394,15 +434,21 @@
     const rows = await feedbackRows(message.rows);
     if (!rows.some(row => row.verdict === 'wrong')) fail('feedback');
     const catalog = record && record.version === 2 ? record.catalog : null;
-    if (catalog && (catalog.length !== rows.length || rows.some(row => !catalog.some(q => q.key === row.key)))) fail('feedback-question');
+    if (catalog && catalog.length !== rows.length) fail('feedback-question');
     for (const row of rows) {
-      const candidates = new Set([row.selected, row.alternate]);
-      const item = catalog && catalog.find(q => q.key === row.key);
+      const candidates = new Set([row.selected, ...row.optionAliases]);
+      const item = catalog && currentQuestion(catalog, row);
+      if (catalog && !item) fail('feedback-question');
       if (item) {
+        row.key = item.key;
         const matches = item.options.filter(option => candidates.has(option));
         if (matches.length !== 1) fail('feedback-option');
         row.selected = matches[0];
       } else {
+        const keys = [row.key, ...row.questionAliases].filter(key =>
+          record && record.history && Object.prototype.hasOwnProperty.call(record.history, key));
+        if (keys.length > 1) fail('feedback-conflict');
+        if (keys.length === 1) row.key = keys[0];
         const known = record && record.history && record.history[row.key];
         if (known && candidates.has(known.correct)) row.selected = known.correct;
         else if (known) {
@@ -411,8 +457,11 @@
           if (matches.length === 1) row.selected = matches[0];
         }
       }
-      delete row.alternate;
+      delete row.questionAliases;
+      delete row.optionAliases;
     }
+    if (new Set(rows.map(row => row.key)).size !== rows.length) fail('feedback-question');
+    rows.sort((a, b) => a.key.localeCompare(b.key));
     const resultDigest = await digest(JSON.stringify(rows));
     // Re-observing or reloading this result cannot create another retake authorization.
     if (record && record.version === 2 && record.resultDigest === resultDigest) {
@@ -512,6 +561,13 @@
           }
           await saveStudyRoutes();
         }
+        if (owner.resultPage && record && record.tabId === owner.tabId &&
+            record.nextDocumentId === owner.documentId) {
+          delete record.nextClaimed;
+          delete record.nextDocumentId;
+          record.at = Date.now();
+          await saveRecords();
+        }
       }
       if (record && record.documentId === owner.documentId && record.tabId === owner.tabId) {
         await stop(owner.key);
@@ -544,15 +600,31 @@
           continuation: result.status === 'passed' ? continuation(owner, config) : null };
       }
       if (message.action === 'claim-next') {
-        const route = studyRoute(owner);
-        if (!config.enabled || !route || !record || record.status !== 'passed' || record.tabId !== owner.tabId ||
+        if (!config.enabled || !record || record.status !== 'passed' || record.tabId !== owner.tabId ||
+            record.nextClaimed ||
             !['native', 'saved'].includes(message.method)) fail('changed');
-        const target = message.method === 'saved' ? continuation(owner, config).nextUrl : '';
-        if (message.method === 'saved' && !target) fail('changed');
+        const saved = studyRoutes[owner.tabId];
+        const current = saved && saved.key === owner.key && saved.ready && Date.now() - saved.at < 86400000;
+        if (current && (saved.claimed || saved.paused)) fail('changed');
+        let route, target;
+        if (message.method === 'native') {
+          target = nextCourseUrl(message.nextUrl, owner);
+          route = studyRoutes[owner.tabId] = { key: owner.key, documentId: owner.documentId,
+            path: target.pathname, courseId: target.searchParams.get('cwid'),
+            ready: true, paused: false, at: Date.now() };
+        } else {
+          route = studyRoute(owner);
+          if (!route || !route.path || !route.courseId) fail('changed');
+          target = nextCourseUrl(route.path + '?cwid=' + encodeURIComponent(route.courseId), owner);
+        }
         route.claimed = true;
         route.resultDocumentId = owner.documentId;
+        record.nextClaimed = true;
+        record.nextDocumentId = owner.documentId;
+        record.at = Date.now();
+        await saveRecords();
         await saveStudyRoutes();
-        return { permitted: true, nextUrl: target };
+        return { permitted: true, nextUrl: target.href };
       }
       if (message.action === 'manual-retake') {
         // Capture feedback before the site's own button navigates; never click or delay it here.
@@ -582,7 +654,7 @@
           record.documentId !== owner.documentId || record.tabId !== owner.tabId ||
           record.fingerprint !== await digest(JSON.stringify(cleanQuestions(message.questions)))) fail('changed');
       record.submitted = await Promise.all(job.answers.map(async (answer, index) =>
-        ({ key: record.catalog[index].key, selected: await digest(optionIdentity(answer.text)) })));
+        ({ key: record.catalog[index].key, selected: await digest(textIdentity(answer.text)) })));
       // Each round gets one submission latch. A verified retake or explicit result-page entry starts a new round.
       record.status = 'submitting'; record.at = Date.now();
       await saveRecords();
@@ -623,6 +695,7 @@
       if (record.version === 2) {
         history = JSON.parse(JSON.stringify(record.history || {}));
         if (record.catalog && !sameCatalog(record.catalog, catalog)) fail('changed');
+        history = currentHistory(history, catalog);
         const expected = Object.keys(history);
         if (expected.length && (expected.length !== catalog.length || catalog.some(q => !history[q.key]))) fail('changed');
       }

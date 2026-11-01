@@ -31,12 +31,38 @@
     'unavailable': '连接已断开，请刷新本页。'
   };
   let stopped = false, submitting = false, working = false, navigating = false, runId = 0;
+  let contextInvalidated = false;
   let pollTimer = null, waitingTimer = null, countdownTimer = null;
   let originalSignature = '', currentAnswers = null, panel = null;
 
   function normalized(value) { return value.normalize('NFC').replace(/\s+/g, ' ').trim(); }
-  function send(action, payload) {
-    return chrome.runtime.sendMessage({ type: CHANNEL, action: action, ...payload });
+  function runtimeAvailable() {
+    try { return !!chrome.runtime && !!chrome.runtime.id && typeof chrome.runtime.sendMessage === 'function'; }
+    catch (err) { return false; }
+  }
+  function invalidateContext() {
+    if (contextInvalidated) return;
+    contextInvalidated = true; stopped = true; working = false; runId += 1;
+    clearTimers();
+    if (document.body) notice('扩展连接已失效', '请刷新本页后继续。', false);
+  }
+  function connected() {
+    if (contextInvalidated) return false;
+    if (runtimeAvailable()) return true;
+    invalidateContext();
+    return false;
+  }
+  async function send(action, payload) {
+    if (!connected()) throw new Error('unavailable');
+    try {
+      // Await inside this function so synchronous throws and promise rejections share cleanup.
+      const reply = await chrome.runtime.sendMessage({ type: CHANNEL, action: action, ...payload });
+      if (!connected()) throw new Error('unavailable');
+      return reply;
+    } catch (err) {
+      if (!runtimeAvailable() || /Extension context invalidated/i.test(String(err && err.message || ''))) invalidateContext();
+      throw contextInvalidated ? new Error('unavailable') : err;
+    }
   }
   function enteredFromResultPage() {
     const navigation = performance.getEntriesByType('navigation')[0];
@@ -61,6 +87,9 @@
     )).some(visible);
   }
   function notice(title, detail, retry) {
+    if (contextInvalidated) {
+      title = '扩展连接已失效'; detail = '请刷新本页后继续。'; retry = false;
+    }
     if (!panel) {
       const host = document.createElement('div');
       host.id = 'huayi-exam-assistant';
@@ -99,7 +128,7 @@
     panel.detail.textContent = detail;
     panel.detail.hidden = !detail;
     panel.pause.hidden = stopped || submitting || !working;
-    panel.restart.hidden = !retry || submitting;
+    panel.restart.hidden = !retry || submitting || contextInvalidated;
   }
   function showAnswerInfo(reply) {
     const info = panel.modelInfo;
@@ -154,8 +183,8 @@
   function stop(title, detail, retry, manual) {
     stopped = true; working = false; runId += 1;
     clearTimers();
-    if (!submitting && !navigating) send('cancel', { manual: manual === true }).catch(function () {});
-    notice(title, detail, retry);
+    if (!contextInvalidated && !submitting && !navigating) send('cancel', { manual: manual === true }).catch(function () {});
+    if (!contextInvalidated) notice(title, detail, retry);
   }
 
   function extract() {
@@ -197,6 +226,7 @@
   }
 
   function unchanged() {
+    if (!connected()) throw new Error('unavailable');
     if (stopped || submitting || siteBlocked()) throw new Error('changed');
     const current = extract();
     if (current.signature !== originalSignature) throw new Error('changed');
@@ -259,7 +289,7 @@
       (uncertain ? '\n存疑 ' + uncertain + ' 题，见答案详情' : '');
     notice(seconds + ' 秒后交卷', summary, false);
     countdownTimer = setInterval(function () {
-      if (stopped || id !== runId) { clearInterval(countdownTimer); return; }
+      if (stopped || id !== runId || !connected()) { clearInterval(countdownTimer); return; }
       seconds -= 1;
       notice(Math.max(seconds, 0) + ' 秒后交卷', summary, false);
       if (seconds > 0) return;
@@ -285,6 +315,7 @@
     notice('正在交卷', '等待考试结果。', false);
     latest.submit.click();
     waitingTimer = setTimeout(function () {
+      if (!connected()) return;
       notice('等待结果', '暂无结果，请查看页面提示。', false);
     }, 15000);
   }
@@ -327,7 +358,7 @@
   }
 
   async function start(retry) {
-    if (submitting) return;
+    if (!connected() || submitting) return;
     clearTimers(); stopped = false; working = true; currentAnswers = null;
     const id = ++runId;
     notice('读取题目中', '', false);
@@ -380,6 +411,7 @@
   }
 
   async function retryExam(result, reply, id) {
+    if (!connected()) throw new Error('unavailable');
     if (stopped || id !== runId || siteBlocked()) throw new Error('changed');
     const current = readResult();
     if (!current || current.signature !== result.signature) throw new Error('changed');
@@ -389,11 +421,13 @@
     if (!claim || !claim.permitted) throw new Error(claim && claim.error || 'changed');
     const latest = readResult();
     if (siteBlocked() || !latest || latest.signature !== result.signature) throw new Error('changed');
+    if (!connected()) throw new Error('unavailable');
     navigating = true; working = false;
     clearTimers();
     notice('正在重考', '等待页面跳转。', false);
     retryButton().click();
     waitingTimer = setTimeout(function () {
+      if (!connected()) return;
       notice('等待重考', '暂无跳转，请查看页面提示。', false);
     }, 15000);
   }
@@ -403,20 +437,34 @@
     if (stopped || id !== runId) return;
     if (!reply) throw new Error('unavailable');
     if (reply.status === 'passed') {
-      if (reply.enabled === false || !reply.continuation || !reply.continuation.nextUrl) {
+      const state = reply.continuation && reply.continuation.state;
+      if (reply.enabled === false || state === 'paused' || state === 'claimed') {
         stopped = true; working = false;
-        notice('考试通过', '', false);
+        const detail = reply.enabled === false ? '自动处理已关闭，开启后点重试继续。' :
+          state === 'paused' ? '连播已暂停，点重试继续。' :
+          '已发起下一课跳转，请查看页面提示。';
+        notice('考试通过', detail, reply.enabled === false || state === 'paused');
         return;
       }
+      const native = nativeNextCourse();
+      const saved = !native && reply.continuation && reply.continuation.nextUrl;
+      const plan = native || (saved ? { element: null, target: courseTarget(saved) } : null);
+      if (!plan) {
+        stopped = true; working = false;
+        notice('考试通过', state === 'finished' ? '没有待接续的必修视频。' :
+          '未找到下一课入口，请查看原站课程列表。', false);
+        return;
+      }
+      if (!plan.target) throw new Error('changed');
       let seconds = 3;
       notice('考试通过', seconds + ' 秒后进入下一课', false);
       countdownTimer = setInterval(function () {
-        if (stopped || id !== runId) { clearInterval(countdownTimer); return; }
+        if (stopped || id !== runId || !connected()) { clearInterval(countdownTimer); return; }
         seconds -= 1;
         notice('考试通过', Math.max(0, seconds) + ' 秒后进入下一课', false);
         if (seconds > 0) return;
         clearInterval(countdownTimer);
-        continueCourse(reply.continuation.nextUrl, id).catch(function (err) {
+        continueCourse(plan, id).catch(function (err) {
           if (id === runId) stop('连播已暂停', errors[err.message] || errors.unavailable, true);
         });
       }, 1000);
@@ -435,7 +483,7 @@
     const detail = '错题：' + wrong + '。已排除错选项。';
     notice(seconds + ' 秒后重考', detail, false);
     countdownTimer = setInterval(function () {
-      if (stopped || id !== runId) { clearInterval(countdownTimer); return; }
+      if (stopped || id !== runId || !connected()) { clearInterval(countdownTimer); return; }
       seconds -= 1;
       notice(Math.max(seconds, 0) + ' 秒后重考', detail, false);
       if (seconds > 0) return;
@@ -454,63 +502,98 @@
           !/^\/course_ware\/course_ware(?:_[a-z0-9]+)?\.aspx$/i.test(url.pathname) ||
           !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(course) ||
           course === (new URL(location.href).searchParams.get('cwid') || '').toLowerCase()) return null;
+      url.search = ''; url.hash = '';
+      url.searchParams.set('cwid', course);
       return { course: course, url: url.href };
     } catch (err) { return null; }
   }
 
-  function nativeNextCourse(target) {
+  function nativeNextCourse() {
+    const lists = Array.from(document.querySelectorAll('ul.state_cour_ul')).filter(visible);
+    if (lists.length > 1) throw new Error('changed');
+    if (!lists.length) return null;
     const candidates = [];
-    for (const row of document.querySelectorAll('li.state_cour_lis')) {
-      // Match the recorded course ID, never the first button or a recommended elective.
+    let required = false, sections = 0;
+    for (const row of lists[0].childNodes) {
+      if (row.nodeType !== Node.ELEMENT_NODE && row.nodeType !== Node.TEXT_NODE) continue;
+      if (row instanceof Element && !visible(row)) continue;
+      if (!(row instanceof Element) || !row.matches('li.state_cour_lis')) {
+        const heading = normalized(row.textContent || '');
+        if (!heading) continue;
+        required = /^课程学习与考试(?:\s*帮助)?$/.test(heading);
+        if (required && ++sections > 1) throw new Error('changed');
+        continue;
+      }
+      if (!required || !visible(row) || row.querySelector('.state_cho')) continue;
+      const markers = Array.from(row.querySelectorAll('.state_lis_tit, .state_lis_tips'))
+        .map(element => normalized(element.textContent));
+      if (markers.some(text => text && !/^(必修|视频)$/.test(text))) continue;
+      const actions = [];
       for (const element of row.querySelectorAll('input[type="button"], button, a[href]')) {
         const label = normalized(element.value || element.textContent || '');
         if (!/^(立即学习|继续学习|下一课件|下一课|下一集|学习下一课)$/.test(label) || !visible(element)) continue;
-        const assignment = (element.getAttribute('onclick') || '').match(/window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i);
-        const link = courseTarget(assignment ? assignment[1] : element.getAttribute('href'));
-        if (link && link.course === target.course) candidates.push(element);
+        const source = element.getAttribute('onclick') || element.getAttribute('href') || '';
+        const assignment = source.match(/window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i);
+        actions.push({ element: element, source: source,
+          target: courseTarget(assignment ? assignment[1] : element.getAttribute('href')) });
       }
+      if (actions.length > 1) throw new Error('changed');
+      candidates.push(...actions);
     }
-    if (candidates.length > 1) throw new Error('changed');
-    const element = candidates[0];
-    if (element && (element.disabled || element.getAttribute('aria-disabled') === 'true')) throw new Error('changed');
-    return element || null;
+    const first = candidates[0];
+    if (!first) return null;
+    if (!first.target || first.element.disabled || first.element.getAttribute('aria-disabled') === 'true' ||
+        candidates.filter(item => item.target && item.target.course === first.target.course).length !== 1) throw new Error('changed');
+    return first;
   }
 
-  async function continueCourse(nextUrl, id) {
+  function sameNextCourse(plan) {
+    const current = nativeNextCourse();
+    if (!plan.element) return !current;
+    return current && current.element === plan.element && current.source === plan.source &&
+      current.target.url === plan.target.url;
+  }
+
+  async function continueCourse(plan, id) {
+    if (!connected()) throw new Error('unavailable');
     if (stopped || id !== runId || submitting || navigating) return;
     if (siteBlocked() || readResult()?.outcome !== 'passed') throw new Error('changed');
-    const target = courseTarget(nextUrl);
-    if (!target) throw new Error('changed');
-    const native = nativeNextCourse(target);
-    const claim = await send('claim-next', { method: native ? 'native' : 'saved' });
+    if (!sameNextCourse(plan)) throw new Error('changed');
+    const claim = await send('claim-next', { method: plan.element ? 'native' : 'saved',
+      nextUrl: plan.element ? plan.target.url : undefined });
     if (stopped || id !== runId) return;
     if (!claim || !claim.permitted || siteBlocked() || readResult()?.outcome !== 'passed') throw new Error('changed');
-    if (native && (!native.isConnected || nativeNextCourse(target) !== native)) throw new Error('changed');
-    if (!native && courseTarget(claim.nextUrl)?.course !== target.course) throw new Error('changed');
+    if (!sameNextCourse(plan) || courseTarget(claim.nextUrl)?.url !== plan.target.url) throw new Error('changed');
+    if (!connected()) throw new Error('unavailable');
     navigating = true; working = false;
     clearTimers();
     notice('进入下一课', '', false);
-    if (native) native.click();
+    if (plan.element) plan.element.click();
     else location.href = claim.nextUrl;
     waitingTimer = setTimeout(function () {
+      if (!connected()) return;
       notice('等待跳转', '请查看原站提示。', false);
     }, 15000);
   }
 
   function startResult(resume) {
+    if (!connected()) return;
     clearTimers(); stopped = false; working = true;
     const id = ++runId, until = Date.now() + 15000;
     notice('读取结果中', '', false);
     async function observe() {
-      if (stopped || id !== runId) return;
+      if (stopped || id !== runId || !connected()) return;
+      let outcome = '';
       try {
         if (siteBlocked()) { stop('需要处理页面提示', '处理后点重试。', true); return; }
         const result = readResult();
+        outcome = result && result.outcome;
         if (result) { await processResult(result, resume, id); return; }
         if (Date.now() >= until) throw new Error('feedback');
         waitingTimer = setTimeout(observe, 500);
       } catch (err) {
-        if (id === runId) stop('重考已暂停', errors[err.message] || errors.unavailable, true);
+        if (id === runId) stop(outcome === 'passed' ? '连播已暂停' : '重考已暂停',
+          errors[err.message] || errors.unavailable, true);
       }
     }
     observe();
@@ -522,6 +605,7 @@
     if (!resultPage || navigating || !(event.target instanceof Element)) return;
     const button = event.target.closest('input.state_foot_btn[type="button"]');
     if (!button || button.value !== '重新考试' || button.disabled || !visible(button) || siteBlocked()) return;
+    if (!connected()) return;
     navigating = true; working = false; runId += 1;
     clearTimers();
     try {
@@ -539,6 +623,7 @@
   window.addEventListener('submit', function (event) {
     if (resultPage || stopped || submitting || !working || event.defaultPrevented ||
         event.target !== document.getElementById('form1')) return;
+    if (!connected()) return;
     submitting = true; working = false; runId += 1;
     clearTimers();
     send('cancel').catch(function () {});
@@ -546,13 +631,13 @@
   });
   window.addEventListener('pagehide', function () {
     stopped = true; runId += 1; clearTimers();
-    if (!submitting && !navigating) send('cancel').catch(function () {});
+    if (!contextInvalidated && !submitting && !navigating) send('cancel').catch(function () {});
   });
   window.addEventListener('pageshow', function (event) {
     if (event.persisted) stop('页面已恢复', '请手动继续。', false);
   });
   chrome.runtime.onMessage.addListener(function (message, sender) {
-    if (sender.id !== chrome.runtime.id || !message || message.type !== CHANNEL ||
+    if (!connected() || sender.id !== chrome.runtime.id || !message || message.type !== CHANNEL ||
         message.action !== 'settings-changed') return;
     if (message.enabled === false && !submitting) {
       stop('自动答题已关闭', errors.disabled, false);
@@ -564,7 +649,7 @@
   if (resultPage) { startResult(false); return; }
   const until = Date.now() + 15000;
   function waitForQuestions() {
-    if (stopped) return;
+    if (stopped || !connected()) return;
     if (document.querySelector('#form1 input[type="radio"]') || Date.now() >= until) start(false);
     else waitingTimer = setTimeout(waitForQuestions, 500);
   }
