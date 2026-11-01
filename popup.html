@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>华医学习助手</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="header">
+    <img src="icons/icon-32.png" width="28" height="28" alt="">
+    <h1>华医学习助手</h1>
+    <span id="version" class="version"></span>
+  </header>
+  <main>
+    <label class="automation" for="exam-enabled">
+      <span>自动答题与交卷</span>
+      <span class="switch">
+        <input type="checkbox" id="exam-enabled" role="switch" disabled>
+        <span class="switch-track" aria-hidden="true"></span>
+      </span>
+    </label>
+    <div class="field mode">
+      <label for="exam-mode">答题模式</label>
+      <select id="exam-mode" disabled>
+        <option value="ai">AI 辅助</option>
+        <option value="sequential">无 AI · 依次尝试</option>
+      </select>
+    </div>
+    <section id="magpie-settings" class="connection" aria-label="Magpie 设置" hidden>
+      <div class="field">
+        <label for="exam-endpoint">Magpie 地址</label>
+        <input id="exam-endpoint" type="url" maxlength="2048" placeholder="http://127.0.0.1:3425" spellcheck="false" autocomplete="off" disabled>
+      </div>
+      <div class="field">
+        <div class="field-heading">
+          <label for="exam-model">模型</label>
+          <button id="exam-load-models" class="refresh" type="button" title="刷新模型列表" disabled>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M5.1 8a8 8 0 0 1 13.2-2L20 8M4 16l1.7 2A8 8 0 0 0 18.9 16"/></svg>
+            刷新
+          </button>
+        </div>
+        <select id="exam-model" disabled><option value="">选择模型</option></select>
+      </div>
+    </section>
+    <footer class="actions">
+      <button id="exam-save" type="button" disabled>保存设置</button>
+      <p id="exam-setting-status" role="status" aria-live="polite">加载中…</p>
+    </footer>
+  </main>
+  <script src="magpie-config.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

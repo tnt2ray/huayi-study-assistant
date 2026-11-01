@@ -1,0 +1,34 @@
+# Local maintenance instructions and agent settings
+AGENTS.md
+AGENT.md
+agents.md
+agent.md
+.codex/
+.agents/
+
+# Private keys and local configuration
+.signing/
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+
+# Local evidence, design drafts and generated packages
+work/
+assets/
+dist/
+*.crx
+*.log
+
+# OS and tool caches
+.DS_Store
+._*
+__pycache__/
+*.py[cod]
+node_modules/
+.cache/
+.idea/
+.vscode/

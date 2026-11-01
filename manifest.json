@@ -1,0 +1,71 @@
+{
+  "manifest_version": 3,
+  "name": "华医网课件免打扰学习助手",
+  "version": "1.0.0",
+  "minimum_chrome_version": "120",
+  "description": "课件原速连播与连接保护；支持 AI 辅助或无 AI 依次作答，按原站反馈重考，通过后继续下一课。",
+  "permissions": ["power", "storage", "alarms"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "24": "icons/icon-24.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "华医网课件免打扰学习助手",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "24": "icons/icon-24.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.91huayi.com/pages/exam.aspx*",
+        "*://*.91huayi.com/pages/exam_result.aspx*"
+      ],
+      "js": ["exam-content.js"],
+      "run_at": "document_end",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "*://*.91huayi.com/course_ware/*"
+      ],
+      "js": [
+        "connection-bridge.js",
+        "study-bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "*://*.91huayi.com/course_ware/*"
+      ],
+      "js": [
+        "session-observer.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.91huayi.com/course_ware/*"
+      ],
+      "js": [
+        "content-main.js"
+      ],
+      "run_at": "document_end",
+      "world": "MAIN"
+    }
+  ]
+}
