@@ -333,4 +333,4 @@ chrome.runtime.onStartup.addListener(function () {
 enqueue(reconcile).catch(function () {});
 
 // The exam workflow has its own short message queue; model calls never block playback protection.
-importScripts('magpie-config.js', 'magpie-client.js', 'exam-background.js');
+importScripts('ai-config.js', 'ai-client.js', 'exam-background.js');

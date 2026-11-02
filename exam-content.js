@@ -5,14 +5,18 @@
   const CHANNEL = 'huayi-exam-v1';
   const resultPage = /exam_result\.aspx$/i.test(location.pathname);
   const errors = {
-    'magpie-offline': '无法连接 Magpie，请检查地址。',
-    'magpie-auth': '访问被拒绝，请检查授权。',
-    'magpie-http': '服务异常，请稍后重试。',
-    'magpie-address': '请在扩展中修改 Magpie 地址。',
-    'magpie-permission': '请在扩展中点“刷新”授权访问。',
-    'magpie-models': '未获取到模型，请刷新列表。',
-    'magpie-model-timeout': '连接超时，请重试。',
-    'magpie-model-unavailable': '模型不可用，请重新选择。',
+    'ai-offline': '无法连接 AI 服务，请检查网络或服务状态。',
+    'ai-auth': '访问被拒绝，请检查 API Key 或账号权限。',
+    'ai-http': 'AI 服务异常，请稍后重试。',
+    'ai-address': '请在扩展中修改 Magpie 地址。',
+    'ai-permission': '请检查 Chrome 访问权限，再到扩展中刷新模型。',
+    'ai-models': '未获取到模型，请检查服务设置后刷新。',
+    'ai-model-timeout': '连接超时，请重试。',
+    'ai-model-unavailable': '模型不可用，请重新选择。',
+    'ai-provider': '请在扩展中选择 AI 供应商。',
+    'ai-key': '请在扩展中填写有效的 API Key。',
+    'ai-quota': 'AI 账号额度不足，请检查所选供应商账户。',
+    'ai-rate-limit': 'AI 服务请求受限，请稍后重试。',
     'timeout': '回答超时，请重试。',
     'model-incomplete': '答案不完整，请重试或换模型。',
     'answer-format': '答案与选项不匹配，请重试。',
@@ -30,8 +34,7 @@
     'disabled': '可在扩展中开启。',
     'unavailable': '连接已断开，请刷新本页。'
   };
-  let stopped = false, submitting = false, working = false, navigating = false, nativeRetryCalled = false, runId = 0;
-  let navigationPending = false;
+  let stopped = false, submitting = false, working = false, navigating = false, runId = 0;
   let contextInvalidated = false;
   let pollTimer = null, waitingTimer = null, countdownTimer = null;
   let originalSignature = '', currentAnswers = null, panel = null;
@@ -75,66 +78,6 @@
         /^\/pages\/exam_result\.aspx$/i.test(previous.pathname) &&
         (previous.searchParams.get('cwid') || '').toLowerCase() === course.toLowerCase();
     } catch (err) { return false; }
-  }
-  function entryKey() {
-    try { return window.navigation?.currentEntry?.key || ''; }
-    catch (err) { return ''; }
-  }
-  function historyTraversal() {
-    return performance.getEntriesByType('navigation')[0]?.type === 'back_forward';
-  }
-  function historyPair(offset, page) {
-    try {
-      const navigation = window.navigation;
-      if (!navigation || typeof navigation.entries !== 'function' || typeof navigation.back !== 'function' ||
-          typeof navigation.forward !== 'function') return null;
-      const entries = navigation.entries(), current = navigation.currentEntry;
-      const index = entries.findIndex(entry => entry.key === current?.key), target = entries[index + offset];
-      if (index < 0 || !target || target.sameDocument || !current.key || !target.key || current.key === target.key) return null;
-      const url = new URL(target.url), course = new URL(location.href).searchParams.get('cwid');
-      if (!course || url.origin !== location.origin || url.username || url.password ||
-          url.pathname.toLowerCase() !== '/pages/' + page + '.aspx' ||
-          (url.searchParams.get('cwid') || '').toLowerCase() !== course.toLowerCase()) return null;
-      return { entryKey: current.key, targetEntryKey: target.key };
-    } catch (err) { return null; }
-  }
-  function sameHistoryPair(offset, page, expected) {
-    const current = historyPair(offset, page);
-    return current && current.entryKey === expected.entryKey && current.targetEntryKey === expected.targetEntryKey;
-  }
-  async function traverseHistory(method, pair, id) {
-    const navigation = window.navigation, info = {};
-    let superseded = false;
-    const observe = event => { if (event.info !== info) superseded = true; };
-    const cleanup = function () {
-      navigation.removeEventListener('navigate', observe);
-      window.removeEventListener('pagehide', cleanup);
-    };
-    navigation.addEventListener('navigate', observe);
-    window.addEventListener('pagehide', cleanup, { once: true });
-    try {
-      const transition = navigation[method]({ info: info });
-      transition.finished.catch(function () {});
-      waitingTimer = setTimeout(function () {
-        if (!stopped && id === runId && connected()) {
-          notice('等待页面跳转', '请查看原站或浏览器提示。', false);
-        }
-      }, 15000);
-      await transition.committed;
-      if (!stopped && id === runId) stop('重考已暂停', errors.changed, false);
-      return false;
-    } catch (err) {
-      if (stopped || id !== runId || !connected()) return false;
-      clearTimeout(waitingTimer);
-      if (superseded || err.name === 'AbortError' || siteBlocked() || entryKey() !== pair.entryKey) {
-        stop('重考已暂停', '页面导航已取消或发生变化，请手动继续。', false);
-        if (!superseded && entryKey() === pair.entryKey) navigating = false;
-        return false;
-      }
-      // Only a rejected traversal, while its source is still active, permits native fallback.
-      navigationPending = false;
-      return true;
-    } finally { cleanup(); }
   }
   function visible(element) {
     if (!element || !element.isConnected || !element.getClientRects().length) return false;
@@ -200,8 +143,7 @@
     summary.textContent = '答案详情';
     const model = document.createElement('p');
     model.textContent = reply.mode === 'sequential' ? '无 AI · 第 ' + (reply.attempt || 1) + ' 轮' :
-      reply.requested === 0 ? '全部复用已确认答案' : '模型：' + (reply.model || 'Magpie');
-    if (reply.numberAnchored) model.textContent += ' · 题序已核对，沿用题号';
+      reply.requested === 0 ? '全部复用已确认答案' : '模型：' + (reply.model || 'AI');
     const choices = document.createElement('p');
     choices.textContent = reply.answers.map(answer => answer.n + '. ' + answer.answer).join('  ');
     details.append(summary, model, choices);
@@ -289,7 +231,7 @@
 
   function unchanged() {
     if (!connected()) throw new Error('unavailable');
-    if (stopped || submitting || navigationPending || siteBlocked()) throw new Error('changed');
+    if (stopped || submitting || siteBlocked()) throw new Error('changed');
     const current = extract();
     if (current.signature !== originalSignature) throw new Error('changed');
     return current;
@@ -419,7 +361,7 @@
     }
   }
 
-  async function start(retry, historyBack) {
+  async function start(retry) {
     if (!connected() || submitting) return;
     clearTimers(); stopped = false; working = true; currentAnswers = null;
     const id = ++runId;
@@ -431,7 +373,7 @@
       const current = extract();
       originalSignature = current.signature;
       await processReply(await send('start', { questions: current.questions, retry: retry === true,
-        fromResultPage: enteredFromResultPage(), entryKey: entryKey(), historyBack: historyBack === true }), id);
+        fromResultPage: enteredFromResultPage() }), id);
     } catch (err) {
       if (id === runId) stop('答题已暂停', errors[err.message] || errors.unavailable, true);
     }
@@ -472,87 +414,26 @@
     return buttons[0];
   }
 
-  function unchangedResult(result, id) {
+  async function retryExam(result, reply, id) {
     if (!connected()) throw new Error('unavailable');
-    if (stopped || id !== runId || navigationPending || siteBlocked()) throw new Error('changed');
+    if (stopped || id !== runId || siteBlocked()) throw new Error('changed');
     const current = readResult();
     if (!current || current.signature !== result.signature) throw new Error('changed');
-  }
-  async function nativeRetry(result, reply, id, fallback) {
-    unchangedResult(result, id);
-    const button = retryButton();
-    const claim = await send(fallback ? 'fallback-retry' : 'claim-retry', {
-      resultDigest: reply.resultDigest, method: 'native', entryKey: entryKey()
-    });
+    retryButton();
+    const claim = await send('claim-retry', { resultDigest: reply.resultDigest });
     if (stopped || id !== runId) return;
     if (!claim || !claim.permitted) throw new Error(claim && claim.error || 'changed');
-    unchangedResult(result, id);
-    if (retryButton() !== button) throw new Error('changed');
+    const latest = readResult();
+    if (siteBlocked() || !latest || latest.signature !== result.signature) throw new Error('changed');
+    if (!connected()) throw new Error('unavailable');
     navigating = true; working = false;
     clearTimers();
     notice('正在重考', '等待页面跳转。', false);
-    nativeRetryCalled = true;
-    button.click();
+    retryButton().click();
     waitingTimer = setTimeout(function () {
       if (!connected()) return;
       notice('等待重考', '暂无跳转，请查看页面提示。', false);
     }, 15000);
-  }
-  async function retryExam(result, reply, id) {
-    unchangedResult(result, id);
-    const pair = historyPair(-1, 'exam');
-    if (!pair) { await nativeRetry(result, reply, id, false); return; }
-    const claim = await send('claim-retry', { resultDigest: reply.resultDigest, method: 'back', ...pair });
-    if (stopped || id !== runId) return;
-    if (claim?.error === 'back-unavailable') { await nativeRetry(result, reply, id, false); return; }
-    if (!claim || !claim.permitted) throw new Error(claim && claim.error || 'changed');
-    unchangedResult(result, id);
-    if (!sameHistoryPair(-1, 'exam', pair)) throw new Error('changed');
-    navigating = true; working = false;
-    clearTimers();
-    notice('返回原考试页', '已保存本轮对错记录。', false);
-    if (await traverseHistory('back', pair, id)) {
-      navigating = false; working = true;
-      await nativeRetry(result, reply, id, true);
-    }
-  }
-  async function returnForNative(id) {
-    const pair = historyPair(1, 'exam_result');
-    if (!pair || navigationPending || siteBlocked()) throw new Error('changed');
-    const claim = await send('return-retry', pair);
-    if (stopped || id !== runId) return;
-    if (!claim || !claim.permitted || navigationPending || siteBlocked() ||
-        !sameHistoryPair(1, 'exam_result', pair)) throw new Error('changed');
-    navigating = true; working = false;
-    clearTimers();
-    notice('回退页无法继续', '返回结果页，使用原站重新考试。', false);
-    if (await traverseHistory('forward', pair, id)) stop('重考已暂停', '无法返回结果页，请手动继续。', false);
-  }
-  async function resumeHistoryPage() {
-    if (!connected()) return;
-    clearTimers(); stopped = false; working = true;
-    const id = ++runId;
-    notice('恢复重考页面', '核对本轮接续信息。', false);
-    try {
-      if (siteBlocked()) { stop('需要处理页面提示', '请手动继续。', false); return; }
-      const claim = await send(resultPage ? 'resume-retry' : 'resume-back', { entryKey: entryKey() });
-      if (stopped || id !== runId) return;
-      if (navigationPending) throw new Error('changed');
-      if (!claim || !claim.permitted) { stop('页面已恢复', '请从结果页重新考试。', false); return; }
-      // A matching, same-tab history handoff is the only way to release a cached script's old submit flag.
-      submitting = false; navigating = false; nativeRetryCalled = false;
-      if (resultPage) { startResult(false); return; }
-      if (siteBlocked()) { stop('需要处理页面提示', '请手动继续。', false); return; }
-      try { extract(); }
-      catch (err) {
-        if (err.message !== 'questions') throw err;
-        await returnForNative(id);
-        return;
-      }
-      await start(false, true);
-    } catch (err) {
-      if (id === runId) stop('重考已暂停', errors[err.message] || errors.unavailable, false);
-    }
   }
 
   async function processResult(result, resume, id) {
@@ -594,20 +475,16 @@
       return;
     }
     if (reply.enabled === false) { stop('自动答题已关闭', errors.disabled, true); return; }
-    if (reply.status === 'retrying' && reply.retryMethod === 'fallback' && result.outcome === 'failed') {
-      await nativeRetry(result, reply, id, true);
-      return;
-    }
     if (reply.status !== 'failed' || !reply.retryAvailable) {
       stop('重考已暂停', errors[reply.error] ||
         (reply.status === 'other-page' ? '本课件正在其他页面处理，请回到该页面。' :
           '请查看本轮结果。'), reply.status === 'failed' && !reply.error);
       return;
     }
-    if (!historyPair(-1, 'exam')) retryButton();
+    retryButton();
     let seconds = 5;
     const wrong = result.rows.filter(row => row.verdict === 'wrong').map(row => row.n).join('、');
-    const detail = '错题：' + wrong + '。已排除错选项，优先返回原考试页。';
+    const detail = '错题：' + wrong + '。已排除错选项。';
     notice(seconds + ' 秒后重考', detail, false);
     countdownTimer = setInterval(function () {
       if (stopped || id !== runId || !connected()) { clearInterval(countdownTimer); return; }
@@ -729,11 +606,11 @@
   // Save manual retake feedback before the native onclick changes location. This listener
   // never pauses for ordinary input, prevents navigation, or issues a second button click.
   document.addEventListener('click', function (event) {
-    if (!resultPage || nativeRetryCalled || !(event.target instanceof Element)) return;
+    if (!resultPage || navigating || !(event.target instanceof Element)) return;
     const button = event.target.closest('input.state_foot_btn[type="button"]');
     if (!button || button.value !== '重新考试' || button.disabled || !visible(button) || siteBlocked()) return;
     if (!connected()) return;
-    navigating = true; nativeRetryCalled = true; working = false; runId += 1;
+    navigating = true; working = false; runId += 1;
     clearTimers();
     try {
       const result = readResult();
@@ -760,9 +637,8 @@
     stopped = true; runId += 1; clearTimers();
     if (!contextInvalidated && !submitting && !navigating) send('cancel').catch(function () {});
   });
-  window.navigation?.addEventListener('navigate', function () { navigationPending = true; });
   window.addEventListener('pageshow', function (event) {
-    if (event.persisted) { navigationPending = false; resumeHistoryPage(); }
+    if (event.persisted) stop('页面已恢复', '请手动继续。', false);
   });
   chrome.runtime.onMessage.addListener(function (message, sender) {
     if (!connected() || sender.id !== chrome.runtime.id || !message || message.type !== CHANNEL ||
@@ -774,18 +650,11 @@
       start(true);
     }
   });
-  if (resultPage) {
-    if (historyTraversal()) resumeHistoryPage();
-    else startResult(false);
-    return;
-  }
+  if (resultPage) { startResult(false); return; }
   const until = Date.now() + 15000;
   function waitForQuestions() {
     if (stopped || !connected()) return;
-    if (document.querySelector('#form1 input[type="radio"]') || Date.now() >= until) {
-      if (historyTraversal()) resumeHistoryPage();
-      else start(false);
-    }
+    if (document.querySelector('#form1 input[type="radio"]') || Date.now() >= until) start(false);
     else waitingTimer = setTimeout(waitForQuestions, 500);
   }
   waitForQuestions();

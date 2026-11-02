@@ -27,10 +27,26 @@
         <option value="sequential">无 AI · 依次尝试</option>
       </select>
     </div>
-    <section id="magpie-settings" class="connection" aria-label="Magpie 设置" hidden>
+    <aside id="sequential-warning" class="warning" role="alert" hidden>
+      <strong>无 AI 模式可能停住</strong>
+      <p>每次进入考试，题目都会重新排序。华医网还会故意在不同页面使用错字，增加程序自动匹配的难度；无 AI 模式可能因此匹配失败并停止自动作答，需要手动处理。</p>
+    </aside>
+    <section id="ai-settings" class="connection" aria-label="AI 设置" hidden>
       <div class="field">
+        <label for="exam-provider">AI 供应商</label>
+        <select id="exam-provider" disabled>
+          <option value="magpie">Magpie</option>
+          <option value="deepseek">DeepSeek API</option>
+        </select>
+        <p id="ai-provider-note" class="field-note"></p>
+      </div>
+      <div id="magpie-endpoint-field" class="field" hidden>
         <label for="exam-endpoint">Magpie 地址</label>
         <input id="exam-endpoint" type="url" maxlength="2048" placeholder="http://127.0.0.1:3425" spellcheck="false" autocomplete="off" disabled>
+      </div>
+      <div id="api-key-field" class="field" hidden>
+        <label for="exam-api-key">API Key</label>
+        <input id="exam-api-key" type="password" maxlength="8192" placeholder="填写 DeepSeek API Key" spellcheck="false" autocomplete="off" disabled>
       </div>
       <div class="field">
         <div class="field-heading">
@@ -48,7 +64,7 @@
       <p id="exam-setting-status" role="status" aria-live="polite">加载中…</p>
     </footer>
   </main>
-  <script src="magpie-config.js"></script>
+  <script src="ai-config.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -2,8 +2,7 @@
 
 (function () {
   const CHANNEL = 'huayi-exam-v1';
-  const gateway = globalThis.HuayiMagpieConfig;
-  const DEFAULTS = { enabled: true, mode: 'ai', baseUrl: gateway.defaultBaseUrl, model: '' };
+  const gateway = globalThis.HuayiAIConfig;
   const jobs = new Map();
   let records = {};
   let studyRoutes = {};
@@ -56,14 +55,6 @@
     const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
     return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
   }
-  async function entryDigest(value) {
-    if (typeof value !== 'string' || !value.length || value.length > 128 || /[\u0000-\u001f\u007f]/.test(value)) fail('changed');
-    return digest(value);
-  }
-  function pendingRetake(record, owner) {
-    return record && record.status === 'retrying' && record.tabId === owner.tabId &&
-      !record.paused && Number.isFinite(record.retryAt) && Date.now() - record.retryAt <= 120000;
-  }
 
   async function saveRecords() {
     // Keep only bounded status/digest records, never question text, model reasoning or credentials.
@@ -75,10 +66,7 @@
 
   async function settings() {
     const saved = await chrome.storage.local.get('examSettings');
-    const value = saved.examSettings || DEFAULTS;
-    return { enabled: value.enabled !== false, mode: value.mode === 'sequential' ? 'sequential' : DEFAULTS.mode,
-      baseUrl: gateway.normalizeBaseUrl(value.baseUrl || DEFAULTS.baseUrl),
-      model: gateway.validModel(value.model) ? value.model : DEFAULTS.model };
+    return gateway.normalizeSettings(saved.examSettings || {});
   }
 
   async function identity(sender, allowCourseware) {
@@ -203,12 +191,6 @@
     });
   }
 
-  function responseText(response) {
-    return (response.output || []).filter(item => item.type === 'message')
-      .flatMap(item => item.content || []).filter(item => item.type === 'output_text')
-      .map(item => item.text || '').join('');
-  }
-
   async function requestAnswers(questions, config, controller) {
     // Streaming receives headers early. A bounded keepalive covers model computation in MV3.
     const deadline = setTimeout(() => controller.abort(), 180000);
@@ -227,66 +209,17 @@
       '每个题号恰好出现一次，answer必须是该题提供的字母，text必须与所选选项原文完全一致。'
     ].join('\n');
     try {
-      const models = await HuayiMagpieClient.models(config.baseUrl, controller.signal);
-      const selected = config.model ? models.find(item => item.id === config.model) : models[0];
-      if (!selected) fail('magpie-model-unavailable');
-      const model = selected.id;
-      const response = await fetch(config.baseUrl + '/v1/responses', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        credentials: 'omit', redirect: 'error', cache: 'no-store', signal: controller.signal,
-        body: JSON.stringify({ model: model, instructions: instructions,
-          input: JSON.stringify({ questions: questions }), stream: true, store: false,
-          ...(selected.lowReasoning ? { reasoning: { effort: 'low' } } : {}), max_output_tokens: 16000 })
-      });
-      clearTimeout(headersDeadline);
-      if (!response.ok) fail(response.status === 401 || response.status === 403 ? 'magpie-auth' : 'magpie-http');
-      if (!response.body) fail('model-incomplete');
-      const streaming = (response.headers.get('content-type') || '').includes('text/event-stream');
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '', output = '', completed = null, bytes = 0;
-      function consume(frame) {
-        const data = frame.split('\n').filter(line => line.startsWith('data:'))
-          .map(line => line.slice(5).trimStart()).join('\n');
-        if (!data || data === '[DONE]') return;
-        let event;
-        try { event = JSON.parse(data); } catch (err) { fail('model-incomplete'); }
-        if (event.type === 'response.output_text.delta') output += event.delta || '';
-        if (event.type === 'response.completed') completed = event.response;
-        if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) fail('model-incomplete');
-        if (output.length > 200000) fail('answer-format');
-      }
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          bytes += value.byteLength;
-          if (bytes > 4 * 1024 * 1024) fail('answer-format');
-          buffer += decoder.decode(value, { stream: true });
-          if (streaming) {
-            buffer = buffer.replace(/\r\n/g, '\n');
-            let split;
-            while ((split = buffer.indexOf('\n\n')) !== -1) {
-              consume(buffer.slice(0, split));
-              buffer = buffer.slice(split + 2);
-            }
-            if (completed) break;
-          }
-        }
-        buffer += decoder.decode();
-        if (streaming) { if (buffer.trim() && !completed) consume(buffer); }
-        else { try { completed = JSON.parse(buffer); } catch (err) { fail('model-incomplete'); } }
-      } finally {
-        await reader.cancel().catch(function () {});
-      }
-      if (!completed || completed.status !== 'completed') fail('model-incomplete');
-      const modelReply = responseText(completed) || output;
-      if (modelReply.length > 200000) fail('answer-format');
-      return { answers: parseAnswers(modelReply, questions), modelReply: modelReply,
-        model: String(completed.model || model).slice(0, 100) };
+      const connection = gateway.active(config);
+      const models = await HuayiAIClient.models(connection, controller.signal);
+      const selected = connection.model ? models.find(item => item.id === connection.model) : models[0];
+      if (!selected) fail('ai-model-unavailable');
+      const result = await HuayiAIClient.complete(connection, selected, instructions, questions, controller.signal,
+        () => clearTimeout(headersDeadline));
+      return { answers: parseAnswers(result.modelReply, questions), modelReply: result.modelReply,
+        model: result.model };
     } catch (err) {
       if (controller.signal.aborted) fail('timeout');
-      if (err instanceof TypeError) fail('magpie-offline');
+      if (err instanceof TypeError) fail('ai-offline');
       throw err;
     } finally {
       clearTimeout(deadline);
@@ -342,12 +275,11 @@
     return result;
   }
 
-  async function answerPlan(questions, catalog, history, numberedHistory) {
+  async function answerPlan(questions, catalog, history) {
     const pending = [], retained = [];
     let excluded = 0;
     for (let i = 0; i < questions.length; i += 1) {
-      const q = questions[i], item = catalog[i];
-      const known = numberedHistory ? numberedHistory[q.n - 1] : history[item.key];
+      const q = questions[i], item = catalog[i], known = history[item.key];
       // Map legacy digests only through the explicitly supported spellings.
       if (known) {
         const wrong = known.wrong.map(hash => currentOption(item, hash));
@@ -382,15 +314,13 @@
     if (!sameDocument && ['requesting', 'ready', 'retrying'].includes(record.status)) return { status: 'other-page' };
     const canReadAnswer = sameDocument && record.status === 'ready' && job;
     return { status: record.status, error: record.error || '', count: record.count, sameDocument: sameDocument,
-      mode: record.mode || 'ai', tried: record.tried || 0,
+      mode: record.mode || 'ai', provider: record.provider || 'magpie', tried: record.tried || 0,
       model: record.model, answers: canReadAnswer ? job.answers : undefined,
       retainedAnswers: sameDocument && record.status === 'requesting' && job ? job.retainedAnswers : undefined,
       modelReply: canReadAnswer ? job.modelReply : undefined, attempt: record.attempt || 1,
       excluded: record.excluded || 0, retained: record.retained || 0,
       requested: record.requested ?? Math.max(0, (record.count || 0) - (record.retained || 0)),
       retryAvailable: sameDocument && record.retryAvailable === true && !record.paused,
-      retryMethod: sameDocument ? record.retryMethod || 'native' : undefined,
-      numberAnchored: sameDocument && record.numberAnchored === true,
       resultDigest: sameDocument ? record.resultDigest : undefined,
       wrongCount: record.wrongCount || 0 };
   }
@@ -434,10 +364,7 @@
       if (message.outcome !== 'passed') fail('feedback-conflict');
       return view(record, owner);
     }
-    const pendingFeedback = record && record.status === 'retrying' && record.documentId === owner.documentId &&
-      ['back', 'fallback'].includes(record.retryMethod);
-    if (record && ['requesting', 'ready', 'retrying'].includes(record.status) && !pendingFeedback) return view(record, owner);
-    if (pendingFeedback && message.outcome !== 'failed') fail('feedback-conflict');
+    if (record && ['requesting', 'ready', 'retrying'].includes(record.status)) return view(record, owner);
     if (message.outcome === 'passed') {
       await stop(owner.key);
       record = records[owner.key] = { ...record, version: 2, status: 'passed',
@@ -484,7 +411,6 @@
       await saveRecords();
       return view(record, owner);
     }
-    if (pendingFeedback) fail('feedback-conflict');
     if (record && record.version === 2 && record.status === 'submitting' &&
         (!record.submitted || record.submitted.length !== rows.length || rows.some(row =>
           !record.submitted.some(item => item.key === row.key && item.selected === row.selected)))) fail('feedback-submission');
@@ -524,16 +450,19 @@
       const previous = await settings();
       // Offline mode neither validates new gateway inputs nor requests gateway permission.
       // Keep the saved AI configuration so switching back does not discard it.
-      const value = { enabled: message.enabled, mode: message.mode,
-        model: previous.model, baseUrl: previous.baseUrl };
+      const value = { ...previous, profiles: { ...previous.profiles }, enabled: message.enabled, mode: message.mode };
       if (value.mode === 'ai') {
         if (message.model !== '' && !gateway.validModel(message.model)) fail('settings');
-        value.model = message.model;
-        value.baseUrl = gateway.normalizeBaseUrl(message.baseUrl);
-        if (value.enabled && !await chrome.permissions.contains({ origins: [gateway.permissionOrigin(value.baseUrl)] })) fail('magpie-permission');
+        const connection = gateway.connection(message.provider, message);
+        if (value.enabled && gateway.provider(connection.provider).keyRequired && !connection.apiKey) fail('ai-key');
+        if (value.enabled && !await chrome.permissions.contains({ origins: [gateway.permissionOrigin(connection.baseUrl)] })) fail('ai-permission');
+        value.provider = connection.provider;
+        value.profiles[value.provider] = { ...(connection.provider === 'magpie' ? { baseUrl: connection.baseUrl } : {}),
+          model: connection.model, apiKey: connection.apiKey };
       }
+      const currentAI = gateway.active(value), previousAI = gateway.active(previous);
       const strategyChanged = value.mode !== previous.mode || (value.mode === 'ai' &&
-        (value.baseUrl !== previous.baseUrl || value.model !== previous.model));
+        (!gateway.sameConnection(currentAI, previousAI) || currentAI.model !== previousAI.model));
       await chrome.storage.local.set({ examSettings: value });
       const restart = new Set();
       if (!value.enabled) {
@@ -593,14 +522,9 @@
             record.status = 'cancelled';
             delete record.submitted;
           } else if (record.status === 'retrying') {
-            if (record.retryBackUsed) {
-              // A pause can release the pending native fallback, never the back traversal already used.
-              record.retryMethod = 'fallback'; record.paused = true;
-            } else {
-              record.status = 'failed';
-              record.retryAvailable = true;
-              delete record.retryAt;
-            }
+            record.status = 'failed';
+            record.retryAvailable = true;
+            delete record.retryAt;
           }
           if (record.status === 'cancelled') record.error = 'cancelled';
         }
@@ -650,31 +574,10 @@
         // Capture feedback before the site's own button navigates; never click or delay it here.
         const result = await acceptResult(message, owner, config);
         const latest = records[owner.key];
-        if (config.enabled && pendingRetake(latest, owner) && ['back', 'fallback'].includes(latest.retryMethod) &&
-            latest.documentId === owner.documentId) {
-          latest.retryMethod = 'native'; latest.retryAt = Date.now(); latest.at = Date.now();
-          await saveRecords();
-          return { permitted: true };
-        }
         if (!config.enabled || !latest || latest.status !== 'failed' || !latest.retryAvailable || latest.paused ||
             latest.tabId !== owner.tabId || latest.documentId !== owner.documentId) return result;
-        latest.status = 'retrying'; latest.retryAvailable = false; latest.retryMethod = 'native';
+        latest.status = 'retrying'; latest.retryAvailable = false;
         latest.retryAt = Date.now(); latest.at = Date.now();
-        await saveRecords();
-        return { permitted: true };
-      }
-      if (message.action === 'resume-retry') {
-        if (!config.enabled || !pendingRetake(record, owner) || record.retryMethod !== 'returning' ||
-            await entryDigest(message.entryKey) !== record.retryFromEntry) return { permitted: false };
-        record.documentId = owner.documentId; record.retryMethod = 'fallback'; record.at = Date.now();
-        await saveRecords();
-        return { permitted: true };
-      }
-      if (message.action === 'fallback-retry') {
-        if (!config.enabled || !pendingRetake(record, owner) || !['back', 'fallback'].includes(record.retryMethod) ||
-            record.documentId !== owner.documentId || message.resultDigest !== record.resultDigest ||
-            await entryDigest(message.entryKey) !== record.retryFromEntry) fail('changed');
-        record.retryMethod = 'native'; record.retryBackUsed = true; record.at = Date.now();
         await saveRecords();
         return { permitted: true };
       }
@@ -682,36 +585,7 @@
       if (!config.enabled || !record || record.status !== 'failed' || !record.retryAvailable || record.paused ||
           record.documentId !== owner.documentId || record.tabId !== owner.tabId ||
           message.resultDigest !== record.resultDigest) fail('changed');
-      const method = message.method === undefined ? 'native' : message.method;
-      if (!['back', 'native'].includes(method)) fail('changed');
-      if (method === 'back') {
-        const from = await entryDigest(message.entryKey), target = await entryDigest(message.targetEntryKey);
-        if (from === target) fail('changed');
-        if (record.examEntryDigest && target !== record.examEntryDigest) {
-          return { permitted: false, error: 'back-unavailable' };
-        }
-        record.retryFromEntry = from; record.retryTargetEntry = target;
-        delete record.retryExamDocumentId;
-      }
-      record.status = 'retrying'; record.retryAvailable = false; record.retryMethod = method;
-      record.retryAt = Date.now(); record.at = Date.now();
-      await saveRecords();
-      return { permitted: true };
-    }
-    if (message.action === 'resume-back') {
-      if (!config.enabled || !pendingRetake(record, owner) || record.retryMethod !== 'back' ||
-          record.documentId === owner.documentId || await entryDigest(message.entryKey) !== record.retryTargetEntry ||
-          (record.retryExamDocumentId && record.retryExamDocumentId !== owner.documentId)) return { permitted: false };
-      record.retryExamDocumentId = owner.documentId; record.retryBackUsed = true; record.at = Date.now();
-      await saveRecords();
-      return { permitted: true };
-    }
-    if (message.action === 'return-retry') {
-      if (!config.enabled || !pendingRetake(record, owner) || record.retryMethod !== 'back' ||
-          record.retryExamDocumentId !== owner.documentId ||
-          await entryDigest(message.entryKey) !== record.retryTargetEntry ||
-          await entryDigest(message.targetEntryKey) !== record.retryFromEntry) fail('changed');
-      record.retryMethod = 'returning'; record.at = Date.now();
+      record.status = 'retrying'; record.retryAvailable = false; record.retryAt = Date.now(); record.at = Date.now();
       await saveRecords();
       return { permitted: true };
     }
@@ -740,13 +614,7 @@
     const questions = cleanQuestions(message.questions);
     const fingerprint = await digest(JSON.stringify(questions));
     const catalog = await describeQuestions(questions);
-    const currentEntry = message.entryKey ? await entryDigest(message.entryKey) : '';
-    const historyBack = message.historyBack === true;
-    const backEntry = record && record.status === 'retrying' && record.retryMethod === 'back';
-    if (historyBack && (!config.enabled || !pendingRetake(record, owner) || !backEntry ||
-        record.retryExamDocumentId !== owner.documentId || currentEntry !== record.retryTargetEntry)) fail('changed');
-    if (backEntry && !historyBack) fail('changed');
-    let history = {}, attempt = 1, numberedHistory = null;
+    let history = {}, attempt = 1;
     if (record) {
       // A normal navigation from this course's result page is a manual retake, not a reload.
       // The isolated script supplies only this boolean, never the referrer's full URL.
@@ -758,8 +626,7 @@
       }
       if (record.status === 'retrying' || resultEntry) {
         if (!resultEntry && (record.tabId !== owner.tabId || record.documentId === owner.documentId ||
-            Date.now() - record.retryAt > 120000 ||
-            (record.retryMethod && !['back', 'native'].includes(record.retryMethod)))) fail('changed');
+            Date.now() - record.retryAt > 120000)) fail('changed');
         attempt = (record.attempt || 1) + 1;
       } else {
         if (['requesting', 'ready'].includes(record.status)) {
@@ -775,20 +642,14 @@
         history = currentHistory(history, catalog);
         const expected = Object.keys(history);
         if (expected.length && (expected.length !== catalog.length || catalog.some(q => !history[q.key]))) fail('changed');
-        if (historyBack && record.fingerprint === fingerprint && record.catalog) {
-          numberedHistory = catalog.map(function (item, index) {
-            if (!record.catalog[index] || !currentQuestion([item], record.catalog[index])) fail('changed');
-            return history[item.key] || null;
-          });
-        }
       }
     }
-    const plan = await answerPlan(questions, catalog, history, numberedHistory);
+    const plan = await answerPlan(questions, catalog, history);
     const job = { controller: new AbortController(), answers: null, retainedAnswers: plan.retained };
     jobs.set(owner.key, job);
     records[owner.key] = { version: 2, tabId: owner.tabId, documentId: owner.documentId,
-      fingerprint: fingerprint, status: 'requesting', mode: config.mode, model: config.mode === 'ai' ? config.model : '',
-      examEntryDigest: currentEntry, numberAnchored: numberedHistory !== null,
+      fingerprint: fingerprint, status: 'requesting', mode: config.mode, provider: config.provider,
+      model: config.mode === 'ai' ? gateway.active(config).model : '',
       catalog: catalog, history: history, attempt: attempt,
       excluded: plan.excluded, retained: plan.retained.length,
       requested: config.mode === 'ai' ? plan.pending.length : 0,
@@ -839,8 +700,8 @@
 
   function safeError(err) {
     const allowed = ['sender', 'questions', 'answer-format', 'model-incomplete',
-      'magpie-auth', 'magpie-http', 'timeout', 'magpie-offline', 'settings', 'changed', 'action',
-      'magpie-address', 'magpie-permission', 'magpie-models', 'magpie-model-timeout', 'magpie-model-unavailable',
+      'ai-auth', 'ai-http', 'timeout', 'ai-offline', 'settings', 'changed', 'action', 'ai-provider', 'ai-key',
+      'ai-address', 'ai-permission', 'ai-models', 'ai-model-timeout', 'ai-model-unavailable', 'ai-quota', 'ai-rate-limit',
       'feedback', 'feedback-question', 'feedback-option', 'feedback-submission', 'feedback-conflict', 'exhausted', 'no-progress'];
     return allowed.includes(err.message) ? err.message : 'unavailable';
   }
@@ -851,9 +712,10 @@
       // Model discovery must not block the queue for cancellation, results or submission.
       initialized.then(async function () {
         if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('popup.html')) fail('sender');
-        const baseUrl = gateway.normalizeBaseUrl(message.baseUrl);
-        const models = await HuayiMagpieClient.models(baseUrl, undefined, message.refresh === true);
-        return { baseUrl: baseUrl, models: models.map(item => ({ id: item.id, label: item.label })) };
+        const connection = gateway.connection(message.provider, message);
+        const models = await HuayiAIClient.models(connection, undefined, message.refresh === true);
+        return { provider: connection.provider, baseUrl: connection.baseUrl,
+          models: models.map(item => ({ id: item.id, label: item.label })) };
       }).then(respond, err => respond({ status: 'error', error: safeError(err) }));
       return true;
     }
