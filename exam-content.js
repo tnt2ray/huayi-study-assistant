@@ -23,6 +23,7 @@
     'interrupted': '请求已中断，请重试。',
     'changed': '题目或状态已变化，请核对。',
     'questions': '题型暂不支持，请手动作答。',
+    'question-ambiguous': '同题干题目无法唯一匹配，请手动处理。',
     'cancelled': '可手动作答或重试。',
     'feedback': '未读到完整对错标记。',
     'feedback-question': '结果页题干与本轮不符。',

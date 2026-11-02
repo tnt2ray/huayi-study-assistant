@@ -229,21 +229,38 @@
   }
 
   async function describeQuestions(questions) {
-    const result = [];
+    const result = [], stems = new Map();
     for (const q of questions) {
-      const question = await identityDigests(questionText(q.question));
-      if (result.some(item => item.key === question.key)) fail('questions');
+      const text = questionText(q.question), question = await identityDigests(text);
+      // Identical source stems may describe different questions. An alias collision may not.
+      if (stems.has(question.key) && stems.get(question.key) !== text) fail('question-ambiguous');
+      stems.set(question.key, text);
       const options = await Promise.all(q.options.map(o => identityDigests(o.text)));
       result.push({ key: question.key, questionAliases: question.aliases,
         options: options.map(o => o.key), optionAliases: options.map(o => o.aliases) });
     }
+    const duplicates = new Set(result.filter((item, index) =>
+      result.some((other, otherIndex) => otherIndex !== index && other.key === item.key)).map(item => item.key));
+    for (const item of result) {
+      if (!duplicates.has(item.key)) continue;
+      // Preserve existing single-stem keys; only duplicate stems need the full option set.
+      item.questionKey = item.key;
+      item.key = await digest(JSON.stringify([item.questionKey, [...item.options].sort()]));
+    }
+    if (new Set(result.map(item => item.key)).size !== result.length) fail('question-ambiguous');
     return result;
   }
 
+  function questionCandidates(catalog, question) {
+    const keys = new Set([question.questionKey || question.key, ...(question.questionAliases || [])]);
+    return catalog.filter(item => keys.has(item.questionKey || item.key) ||
+      (item.questionAliases || []).some(key => keys.has(key)));
+  }
+
   function currentQuestion(catalog, question) {
-    const keys = new Set([question.key, ...(question.questionAliases || [])]);
-    const matches = catalog.filter(item =>
-      keys.has(item.key) || (item.questionAliases || []).some(key => keys.has(key)));
+    const matches = question.options ? questionCandidates(catalog, question).filter(item => sameOptions(item, question)) :
+      catalog.filter(item => item.key === question.key ||
+        (!item.questionKey && (item.questionAliases || []).includes(question.key)));
     return matches.length === 1 ? matches[0] : null;
   }
 
@@ -253,15 +270,20 @@
     return matches.length === 1 ? matches[0] : null;
   }
 
+  function sameOptions(before, after) {
+    if (before.options.length !== after.options.length) return false;
+    const mapped = before.options.map(option => currentOption(after, option));
+    return mapped.every(Boolean) && new Set(mapped).size === after.options.length;
+  }
+
   function sameCatalog(before, after) {
     if (!before || before.length !== after.length) return false;
     const matched = new Set();
     return after.every(item => {
       const old = currentQuestion(before, item);
-      if (!old || matched.has(old.key) || old.options.length !== item.options.length) return false;
+      if (!old || matched.has(old.key)) return false;
       matched.add(old.key);
-      const mapped = old.options.map(o => currentOption(item, o));
-      return mapped.every(Boolean) && new Set(mapped).size === item.options.length;
+      return true;
     });
   }
 
@@ -340,15 +362,16 @@
 
   async function feedbackRows(input) {
     if (!Array.isArray(input) || !input.length || input.length > 50) fail('feedback');
-    const rows = [], numbers = new Set();
+    const rows = [], numbers = new Set(), stems = new Map();
     for (const row of input) {
       if (!row || !Number.isInteger(row.n) || row.n < 1 || row.n > 50 || numbers.has(row.n) ||
           typeof row.question !== 'string' || !questionText(row.question) || row.question.length > 6000 ||
           typeof row.text !== 'string' || !row.text.trim() || row.text.length > 3000 ||
           !['wrong', 'correct'].includes(row.verdict)) fail('feedback');
       numbers.add(row.n);
-      const question = await identityDigests(questionText(row.question));
-      if (rows.some(item => item.key === question.key)) fail('feedback');
+      const text = questionText(row.question), question = await identityDigests(text);
+      if (stems.has(question.key) && stems.get(question.key) !== text) fail('question-ambiguous');
+      stems.set(question.key, text);
       const option = await identityDigests(row.text);
       rows.push({ key: question.key, questionAliases: question.aliases,
         selected: option.key, optionAliases: option.aliases, verdict: row.verdict });
@@ -376,10 +399,18 @@
     if (!rows.some(row => row.verdict === 'wrong')) fail('feedback');
     const catalog = record && record.version === 2 ? record.catalog : null;
     if (catalog && catalog.length !== rows.length) fail('feedback-question');
+    // Without a catalog the result page has no complete option sets to distinguish equal stems.
+    if (!catalog && new Set(rows.map(row => row.key)).size !== rows.length) fail('question-ambiguous');
     for (const row of rows) {
       const candidates = new Set([row.selected, ...row.optionAliases]);
-      const item = catalog && currentQuestion(catalog, row);
-      if (catalog && !item) fail('feedback-question');
+      const questions = catalog ? questionCandidates(catalog, row) : [];
+      if (catalog && !questions.length) fail('feedback-question');
+      // The result only exposes the chosen option. It must identify exactly one same-stem question;
+      // never use question numbers, verdicts or elimination between rows to resolve an ambiguity.
+      const matches = questions.length > 1 ? questions.filter(item => item.options.some(option => candidates.has(option))) : questions;
+      if (matches.length > 1) fail('question-ambiguous');
+      if (questions.length && !matches.length) fail('feedback-option');
+      const item = matches[0];
       if (item) {
         row.key = item.key;
         const matches = item.options.filter(option => candidates.has(option));
@@ -699,7 +730,7 @@
   }
 
   function safeError(err) {
-    const allowed = ['sender', 'questions', 'answer-format', 'model-incomplete',
+    const allowed = ['sender', 'questions', 'question-ambiguous', 'answer-format', 'model-incomplete',
       'ai-auth', 'ai-http', 'timeout', 'ai-offline', 'settings', 'changed', 'action', 'ai-provider', 'ai-key',
       'ai-address', 'ai-permission', 'ai-models', 'ai-model-timeout', 'ai-model-unavailable', 'ai-quota', 'ai-rate-limit',
       'feedback', 'feedback-question', 'feedback-option', 'feedback-submission', 'feedback-conflict', 'exhausted', 'no-progress'];

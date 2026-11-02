@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "华医网课件免打扰学习助手",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "minimum_chrome_version": "120",
   "description": "课件原速连播与连接保护；支持 AI 辅助或无 AI 依次作答，按原站反馈重考，通过后继续下一课。",
   "permissions": ["power", "storage", "alarms"],
